@@ -61,47 +61,79 @@ export default async function handler(req, res) {
       parts: [{ text: String(m.content || "") }],
     }));
 
-    const url =
-      "https://generativelanguage.googleapis.com/v1beta/models/" +
-      encodeURIComponent(model) +
-      ":generateContent?key=" +
-      encodeURIComponent(apiKey);
+    // 모델 폴백 목록: 환경변수 모델을 먼저, 그다음 혼잡이 덜한 대체 모델
+    const fallbacks = [model, "gemini-2.0-flash", "gemini-flash-latest"];
+    const models = fallbacks.filter((m, i) => fallbacks.indexOf(m) === i);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    const geminiRes = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        // 시스템 프롬프트는 Gemini의 전용 필드로 전달
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: contents,
-        generationConfig: { maxOutputTokens: 1024, temperature: 0.7 },
-      }),
+    const reqBody = JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: contents,
+      generationConfig: { maxOutputTokens: 1024, temperature: 0.7 },
     });
 
-    const data = await geminiRes.json();
+    let geminiRes = null;
+    let data = null;
+    let lastStatus = 0;
+    let lastMsg = "";
+    let usedModel = models[0];
 
-    // ── 구체적인 오류 메시지 — 무엇이 잘못됐는지 바로 알 수 있게 ──
-    if (!geminiRes.ok) {
-      const msg = (data && data.error && data.error.message) || "";
-      console.error("Gemini API error:", msg);
+    outer:
+    for (let mi = 0; mi < models.length; mi++) {
+      usedModel = models[mi];
+      const url =
+        "https://generativelanguage.googleapis.com/v1beta/models/" +
+        encodeURIComponent(usedModel) +
+        ":generateContent";
 
-      if (geminiRes.status === 400 && /API key not valid/i.test(msg)) {
+      // 503(과부하)·429·500 같은 일시 오류는 잠깐 기다렸다 재시도
+      for (let attempt = 0; attempt < 3; attempt++) {
+        geminiRes = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+          body: reqBody,
+        });
+
+        data = await geminiRes.json().catch(() => ({}));
+
+        if (geminiRes.ok) break outer;
+
+        lastStatus = geminiRes.status;
+        lastMsg = (data && data.error && data.error.message) || "";
+
+        if (geminiRes.status === 503 || geminiRes.status === 429 || geminiRes.status === 500) {
+          await sleep(600 * (attempt + 1));
+          continue; // 같은 모델 재시도
+        }
+        break; // 그 외 오류는 다음 모델로
+      }
+    }
+
+    // ── 모든 시도 실패 시: 구체적 오류 메시지 ──
+    if (!geminiRes || !geminiRes.ok) {
+      console.error("Gemini API error:", lastStatus, lastMsg);
+
+      if (lastStatus === 400 && /API key not valid/i.test(lastMsg)) {
         return res.status(502).json({
           error: "API 키가 올바르지 않습니다. Google AI Studio에서 키를 다시 확인하세요.",
         });
       }
-      if (geminiRes.status === 404) {
+      if (lastStatus === 404) {
         return res.status(502).json({
-          error:
-            "모델 '" + model + "'을(를) 찾을 수 없습니다. 환경 변수 'GEMINI_MODEL'을 확인하세요.",
+          error: "모델을 찾을 수 없습니다. 환경 변수 'GEMINI_MODEL'을 확인하세요.",
         });
       }
-      if (geminiRes.status === 429) {
+      if (lastStatus === 429) {
         return res.status(502).json({
-          error: "오늘의 무료 사용 한도를 초과했습니다. 잠시 후 다시 시도하세요.",
+          error: "지금 사용량이 많아요. 잠시 후 다시 시도해 줘.",
         });
       }
-      return res.status(502).json({ error: "AI 응답 오류: " + (msg || "알 수 없는 오류") });
+      if (lastStatus === 503) {
+        return res.status(502).json({
+          error: "지금 잠깐 혼잡해요. 잠시 후 다시 시도해 줘.",
+        });
+      }
+      return res.status(502).json({ error: "AI 응답 오류: " + (lastMsg || "알 수 없는 오류") });
     }
 
     const answer =
